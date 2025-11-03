@@ -1,7 +1,7 @@
 import { useState, useRef } from "react";
 import { Upload, CircleHelp, File, X, Download } from "lucide-react";
 
-const API_URL = "http://localhost:8000";
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 interface Match {
   name: string;
@@ -212,7 +212,7 @@ export default function App() {
         <textarea
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Ex. Mr. John A. Doe (Johnny)	AlphaTech Ltd., CFO, 2002 - 2007, Smart Solutions LLC, CEO, 2015 - 2025"
+          placeholder="Ex. Mr. John A. Doe (Johnny)     AlphaTech Ltd., CFO, 2002 - 2007, Smart Solutions LLC, CEO, 2015 - 2025"
           rows={3}
           className="w-full border border-gray-300 rounded-lg p-3 mb-4 text-gray-600 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#3464DE]"
         />
