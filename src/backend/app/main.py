@@ -1,17 +1,43 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
 import io
 import pandas as pd
+import re
+import os
 
 from .models import MatchRequest, MatchResponse, MatchResult, UploadResponse, HealthResponse, ExportRequest
 from .tfidf_model import TFIDFModel
 from .data_parser import DataParser
 
+# Security constants
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+ALLOWED_MIME_TYPES = [
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',  # .xlsx
+    'application/vnd.ms-excel',  # .xls
+]
+
 # Global variables
 search_model = None
 dataset = None
+
+def sanitize_excel_value(value):
+    """
+    Sanitize values to prevent Excel formula injection.
+    Prefixes dangerous characters with a single quote to treat them as text.
+    """
+    if not isinstance(value, str):
+        return value
+    
+    # Characters that could start Excel formulas or commands
+    dangerous_chars = ['=', '+', '-', '@', '\t', '\r']
+    
+    # If the value starts with a dangerous character, prefix with single quote
+    if value and value[0] in dangerous_chars:
+        return "'" + value
+    
+    return value
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -32,13 +58,15 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware
+# CORS middleware - Configured for production
+# In production, this should be restricted to your specific domain
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "").split(",") if os.getenv("ALLOWED_ORIGINS") else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change to specific origins in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,  # Disabled for security unless authentication is added
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 @app.get("/", tags=["Root"])
@@ -70,23 +98,52 @@ async def upload_dataset(file: UploadFile = File(...)):
     - Name
     - Professional Title/Employment & Career
     - Board Service
+    
+    Security: Max file size 10MB, validates MIME type and file content.
     """
     global dataset, search_model
     
-    # Validate file type
-    if not file.filename.endswith(('.xlsx', '.xls')):
+    # Validate filename extension
+    if not file.filename or not file.filename.endswith(('.xlsx', '.xls')):
         raise HTTPException(
             status_code=400, 
-            detail="File must be an Excel file (.xlsx or .xls)"
+            detail="Invalid file type. Only .xlsx and .xls files are allowed."
+        )
+    
+    # Validate MIME type
+    if file.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid content type. Expected Excel file, got {file.content_type}"
         )
     
     try:
-        # Read file contents
-        contents = await file.read()
+        # Read file contents with size limit
+        contents = await file.read(MAX_FILE_SIZE + 1)
+        
+        # Check file size
+        if len(contents) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024*1024)}MB"
+            )
+        
+        if len(contents) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Empty file uploaded"
+            )
         
         # Parse the dataset
         parser = DataParser()
         df = parser.parse_excel_bytes(io.BytesIO(contents))
+        
+        # Validate dataset isn't empty
+        if df.empty:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file contains no data"
+            )
         
         # Validate required columns exist
         required_cols = ['name', 'employment', 'board_service', 'employment_norm', 'board_service_norm']
@@ -94,7 +151,7 @@ async def upload_dataset(file: UploadFile = File(...)):
         if missing:
             raise HTTPException(
                 status_code=400,
-                detail=f"Dataset missing required columns after parsing: {missing}"
+                detail=f"Dataset missing required columns: {', '.join(missing)}"
             )
         
         # Store the dataset globally
@@ -106,13 +163,20 @@ async def upload_dataset(file: UploadFile = File(...)):
         
         return UploadResponse(
             status="success",
-            message=f"Dataset uploaded and indexed successfully",
+            message="Dataset uploaded and indexed successfully",
             rows_loaded=len(df),
             columns=df.columns.tolist()
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+        # Log the actual error server-side but return generic message to client
+        print(f"Upload error: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail="Failed to process uploaded file. Please ensure it's a valid Excel file."
+        )
 
 @app.post("/match", response_model=MatchResponse, tags=["Search"])
 async def match_connections(request: MatchRequest):
@@ -166,18 +230,26 @@ async def match_connections(request: MatchRequest):
 async def export_matches(request: ExportRequest):
     """
     Export match results to Excel file.
+    Security: Sanitizes values to prevent Excel formula injection.
     """
     if not request.matches:
         raise HTTPException(status_code=400, detail="No matches to export")
     
+    # Limit number of matches to export (prevent large file DoS)
+    if len(request.matches) > 1000:
+        raise HTTPException(
+            status_code=400, 
+            detail="Too many matches to export. Maximum is 1000 records."
+        )
+    
     try:
-        # Convert matches to DataFrame
+        # Convert matches to DataFrame with sanitization
         data = []
         for match in request.matches:
             data.append({
-                'Name': match.name,
-                'Employment': match.employment,
-                'Board Service': match.board_service,
+                'Name': sanitize_excel_value(match.name),
+                'Employment': sanitize_excel_value(match.employment),
+                'Board Service': sanitize_excel_value(match.board_service),
                 'Match Score': match.score,
                 'Rank': match.rank
             })
@@ -198,5 +270,12 @@ async def export_matches(request: ExportRequest):
             headers={"Content-Disposition": "attachment; filename=board_matches.xlsx"}
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error exporting file: {str(e)}")
+        # Log actual error but return generic message
+        print(f"Export error: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail="Failed to export results. Please try again."
+        )
